@@ -1,10 +1,15 @@
 import logging
 import os
 import secrets
+import time
+import uuid
+from datetime import datetime
+from collections import deque
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
@@ -76,6 +81,9 @@ DEFAULT_CONFIG = {
 
 MEMORY_INSTANCE = Memory.from_config(DEFAULT_CONFIG)
 
+# 请求日志缓存（内存中保留最近200条）
+REQUEST_LOGS: deque = deque(maxlen=200)
+
 app = FastAPI(
     title="Mem0 REST APIs",
     description=(
@@ -86,6 +94,34 @@ app = FastAPI(
     ),
     version="1.0.0",
 )
+
+# 添加 CORS 中间件，允许 dashboard 前端跨域访问
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """记录每个请求的方法、路径、状态码、耗时等信息。"""
+    start_time = time.time()
+    response = await call_next(request)
+    duration_ms = round((time.time() - start_time) * 1000)
+
+    log_entry = {
+        "id": str(uuid.uuid4()),
+        "method": request.method,
+        "endpoint": str(request.url.path),
+        "status": response.status_code,
+        "latency_ms": duration_ms,
+        "time": datetime.utcnow().isoformat() + "Z",
+    }
+    REQUEST_LOGS.appendleft(log_entry)
+    return response
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -159,9 +195,7 @@ def get_all_memories(
     agent_id: Optional[str] = None,
     _api_key: Optional[str] = Depends(verify_api_key),
 ):
-    """Retrieve stored memories."""
-    if not any([user_id, run_id, agent_id]):
-        raise HTTPException(status_code=400, detail="At least one identifier is required.")
+    """Retrieve stored memories. 不传过滤参数时返回所有记忆。"""
     try:
         params = {
             k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v is not None
@@ -239,9 +273,7 @@ def delete_all_memories(
     agent_id: Optional[str] = None,
     _api_key: Optional[str] = Depends(verify_api_key),
 ):
-    """Delete all memories for a given identifier."""
-    if not any([user_id, run_id, agent_id]):
-        raise HTTPException(status_code=400, detail="At least one identifier is required.")
+    """Delete all memories for a given identifier. 不传参数时删除所有记忆。"""
     try:
         params = {
             k: v for k, v in {"user_id": user_id, "run_id": run_id, "agent_id": agent_id}.items() if v is not None
@@ -262,6 +294,96 @@ def reset_memory(_api_key: Optional[str] = Depends(verify_api_key)):
     except Exception as e:
         logging.exception("Error in reset_memory:")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===================== 实体 & 统计 & 请求日志 接口 =====================
+
+
+@app.get("/entities", summary="List all entities")
+def list_entities(
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
+    """列出所有已知的实体（user_id / agent_id / run_id）及其记忆数量。"""
+    try:
+        all_memories = MEMORY_INSTANCE.get_all()
+        entities_map: Dict[str, Dict[str, Any]] = {}
+
+        memories_list = all_memories if isinstance(all_memories, list) else all_memories.get("results", all_memories.get("memories", []))
+
+        for mem in memories_list:
+            # 提取实体标识
+            metadata = mem.get("metadata", {}) or {}
+            user_id = mem.get("user_id") or metadata.get("user_id")
+            agent_id = mem.get("agent_id") or metadata.get("agent_id")
+            run_id = mem.get("run_id") or metadata.get("run_id")
+
+            if user_id:
+                key = f"user:{user_id}"
+                if key not in entities_map:
+                    entities_map[key] = {"id": user_id, "type": "user", "name": user_id, "memory_count": 0}
+                entities_map[key]["memory_count"] += 1
+
+            if agent_id:
+                key = f"agent:{agent_id}"
+                if key not in entities_map:
+                    entities_map[key] = {"id": agent_id, "type": "agent", "name": agent_id, "memory_count": 0}
+                entities_map[key]["memory_count"] += 1
+
+            if run_id:
+                key = f"run:{run_id}"
+                if key not in entities_map:
+                    entities_map[key] = {"id": run_id, "type": "run", "name": run_id, "memory_count": 0}
+                entities_map[key]["memory_count"] += 1
+
+        return {"entities": list(entities_map.values())}
+    except Exception as e:
+        logging.exception("Error in list_entities:")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/stats", summary="Get dashboard statistics")
+def get_stats(
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
+    """获取仪表盘统计数据：总记忆数、实体数、请求数等。"""
+    try:
+        all_memories = MEMORY_INSTANCE.get_all()
+        memories_list = all_memories if isinstance(all_memories, list) else all_memories.get("results", all_memories.get("memories", []))
+        total_memories = len(memories_list)
+
+        # 统计实体数
+        entity_ids = set()
+        for mem in memories_list:
+            metadata = mem.get("metadata", {}) or {}
+            for field in ["user_id", "agent_id", "run_id"]:
+                val = mem.get(field) or metadata.get(field)
+                if val:
+                    entity_ids.add(f"{field}:{val}")
+
+        # 统计请求日志
+        total_requests = len(REQUEST_LOGS)
+        add_events = sum(1 for r in REQUEST_LOGS if r["method"] == "POST" and r["endpoint"] == "/memories")
+        search_events = sum(1 for r in REQUEST_LOGS if r["endpoint"] == "/search")
+
+        return {
+            "total_memories": total_memories,
+            "total_entities": len(entity_ids),
+            "total_requests": total_requests,
+            "add_events": add_events,
+            "search_events": search_events,
+        }
+    except Exception as e:
+        logging.exception("Error in get_stats:")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/requests", summary="Get recent request logs")
+def get_request_logs(
+    limit: int = 50,
+    _api_key: Optional[str] = Depends(verify_api_key),
+):
+    """获取最近的请求日志。"""
+    return {"requests": list(REQUEST_LOGS)[:limit]}
 
 
 @app.get("/", summary="Redirect to the OpenAPI documentation", include_in_schema=False)
