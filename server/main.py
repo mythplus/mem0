@@ -54,7 +54,15 @@ MEMGRAPH_USERNAME = os.environ.get("MEMGRAPH_USERNAME", "memgraph")
 MEMGRAPH_PASSWORD = os.environ.get("MEMGRAPH_PASSWORD", "mem0graph")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", "/app/history/history.db")
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_LLM_MODEL = os.environ.get("OLLAMA_LLM_MODEL", "qwen3:0.6b")
+OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "qwen3-embedding:0.6b")
+
+# 历史记录数据库路径，默认存放在项目 server 目录下的 history 文件夹中
+_SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_HISTORY_DIR = os.path.join(_SERVER_DIR, "history")
+os.makedirs(_DEFAULT_HISTORY_DIR, exist_ok=True)
+HISTORY_DB_PATH = os.environ.get("HISTORY_DB_PATH", os.path.join(_DEFAULT_HISTORY_DIR, "history.db"))
 
 DEFAULT_CONFIG = {
     "version": "v1.1",
@@ -67,16 +75,23 @@ DEFAULT_CONFIG = {
             "user": POSTGRES_USER,
             "password": POSTGRES_PASSWORD,
             "collection_name": POSTGRES_COLLECTION_NAME,
+            "embedding_model_dims": 1024,
         },
     },
-    "graph_store": {
-        "provider": "neo4j",
-        "config": {"url": NEO4J_URI, "username": NEO4J_USERNAME, "password": NEO4J_PASSWORD},
-    },
-    "llm": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "temperature": 0.2, "model": "gpt-4.1-nano-2025-04-14"}},
-    "embedder": {"provider": "openai", "config": {"api_key": OPENAI_API_KEY, "model": "text-embedding-3-small"}},
+    "llm": {"provider": "ollama", "config": {"model": OLLAMA_LLM_MODEL, "temperature": 0.2, "max_tokens": 2000, "ollama_base_url": OLLAMA_BASE_URL}},
+    "embedder": {"provider": "ollama", "config": {"model": OLLAMA_EMBED_MODEL, "ollama_base_url": OLLAMA_BASE_URL}},
     "history_db_path": HISTORY_DB_PATH,
 }
+
+# 仅在 Neo4j 参数完整时启用图记忆
+if NEO4J_URI and NEO4J_USERNAME and NEO4J_PASSWORD:
+    DEFAULT_CONFIG["graph_store"] = {
+        "provider": "neo4j",
+        "config": {"url": NEO4J_URI, "username": NEO4J_USERNAME, "password": NEO4J_PASSWORD},
+    }
+    logging.info("Graph store (Neo4j) enabled")
+else:
+    logging.info("Graph store (Neo4j) not configured, skipping")
 
 
 MEMORY_INSTANCE = Memory.from_config(DEFAULT_CONFIG)
